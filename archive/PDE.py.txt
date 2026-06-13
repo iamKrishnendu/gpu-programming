@@ -1,0 +1,257 @@
+import math
+import time
+import numpy as np
+
+from numba import cuda
+from numba import njit, prange
+
+# ==========================================================
+# GPU STENCIL KERNEL
+# ==========================================================
+
+@cuda.jit
+def heat_stencil_kernel(current,
+                        next_grid,
+                        alpha):
+
+    row, col = cuda.grid(2)
+
+    nx, ny = current.shape
+
+    if (1 <= row < nx - 1 and
+        1 <= col < ny - 1):
+
+        center = current[row, col]
+
+        north = current[row - 1, col]
+        south = current[row + 1, col]
+        east  = current[row, col + 1]
+        west  = current[row, col - 1]
+
+        next_grid[row, col] = (
+            center +
+            alpha *
+            (
+                north +
+                south +
+                east +
+                west -
+                4.0 * center
+            )
+        )
+
+# ==========================================================
+# CPU STENCIL
+# ==========================================================
+
+@njit(parallel=True, fastmath=True)
+def cpu_stencil(current,
+                next_grid,
+                alpha):
+
+    nx, ny = current.shape
+
+    for i in prange(1, nx - 1):
+
+        for j in range(1, ny - 1):
+
+            center = current[i, j]
+
+            next_grid[i, j] = (
+                center +
+                alpha *
+                (
+                    current[i - 1, j] +
+                    current[i + 1, j] +
+                    current[i, j - 1] +
+                    current[i, j + 1] -
+                    4.0 * center
+                )
+            )
+
+# ==========================================================
+# BOUNDARY CONDITIONS
+# ==========================================================
+
+def apply_boundary(grid):
+
+    grid[0, :] = 100.0
+    grid[-1, :] = 0.0
+
+    grid[:, 0] = 75.0
+    grid[:, -1] = 50.0
+
+# ==========================================================
+# GPU EXECUTION
+# ==========================================================
+
+def gpu_solver(grid,
+               iterations,
+               alpha):
+
+    nx, ny = grid.shape
+
+    stream1 = cuda.stream()
+    stream2 = cuda.stream()
+
+    d_current = cuda.to_device(
+        grid,
+        stream=stream1
+    )
+
+    d_next = cuda.device_array_like(
+        d_current
+    )
+
+    block_dim = (16, 16)
+
+    grid_dim = (
+        math.ceil(nx / block_dim[0]),
+        math.ceil(ny / block_dim[1])
+    )
+
+    for step in range(iterations):
+
+        heat_stencil_kernel[
+            grid_dim,
+            block_dim,
+            stream1
+        ](
+            d_current,
+            d_next,
+            alpha
+        )
+
+        d_current, d_next = (
+            d_next,
+            d_current
+        )
+
+        # periodic sync only
+        if step % 100 == 0:
+
+            d_current.copy_to_host(
+                grid,
+                stream=stream2
+            )
+
+            stream2.synchronize()
+
+            apply_boundary(grid)
+
+            d_current.copy_to_device(
+                grid,
+                stream=stream2
+            )
+
+    d_current.copy_to_host(grid)
+
+    cuda.synchronize()
+
+    return grid
+
+# ==========================================================
+# CPU EXECUTION
+# ==========================================================
+
+def cpu_solver(grid,
+               iterations,
+               alpha):
+
+    current = grid.copy()
+
+    next_grid = np.zeros_like(current)
+
+    for _ in range(iterations):
+
+        cpu_stencil(
+            current,
+            next_grid,
+            alpha
+        )
+
+        apply_boundary(next_grid)
+
+        current, next_grid = (
+            next_grid,
+            current
+        )
+
+    return current
+
+# ==========================================================
+# HYBRID EXECUTION
+# ==========================================================
+
+def hybrid_solver(nx=4096,
+                  ny=4096,
+                  iterations=1000,
+                  alpha=0.25):
+
+    host_grid = cuda.pinned_array(
+        shape=(nx, ny),
+        dtype=np.float32
+    )
+
+    host_grid.fill(0)
+
+    apply_boundary(host_grid)
+
+    workload = nx * ny
+
+    gpu_available = cuda.is_available()
+
+    if gpu_available and workload > 1_000_000:
+
+        print(
+            "Large workload -> GPU execution"
+        )
+
+        result = gpu_solver(
+            host_grid,
+            iterations,
+            alpha
+        )
+
+    else:
+
+        print(
+            "Small workload -> CPU execution"
+        )
+
+        result = cpu_solver(
+            host_grid,
+            iterations,
+            alpha
+        )
+
+    return result
+
+# ==========================================================
+# BENCHMARK
+# ==========================================================
+
+if __name__ == "__main__":
+
+    start = time.time()
+
+    solution = hybrid_solver(
+        nx=4096,
+        ny=4096,
+        iterations=2000,
+        alpha=0.24
+    )
+
+    elapsed = time.time() - start
+
+    print(
+        f"Runtime : {elapsed:.2f} sec"
+    )
+
+    print(
+        "Center Value:",
+        solution[
+            solution.shape[0] // 2,
+            solution.shape[1] // 2
+        ]
+    )
